@@ -10,6 +10,7 @@ import warnings
 from datetime import datetime
 from typing import Any, Dict
 
+import numpy as np
 import pytz
 from pydantic import ValidationError
 
@@ -438,7 +439,7 @@ class Memory(MemoryBase):
             return {"results": all_memories}
 
     def _get_all_from_vector_store(self, filters, limit):
-        memories = self.vector_store.list(filters=filters, limit=limit)
+        memories = self.vector_store.list(filters=filters or None, limit=limit)
 
         excluded_keys = {
             "user_id",
@@ -785,6 +786,160 @@ class Memory(MemoryBase):
 
     def chat(self, query):
         raise NotImplementedError("Chat function not implemented yet.")
+
+    def backup_to_file(self, file_path, user_id=None, agent_id=None, run_id=None, filters=None):
+        """
+        Backup memories to a file.
+        
+        Args:
+            file_path (str): Path to save the backup file.
+            user_id (str, optional): Filter memories by user ID.
+            agent_id (str, optional): Filter memories by agent ID.
+            run_id (str, optional): Filter memories by run ID.
+            filters (dict, optional): Additional filters to apply.
+            
+        Returns:
+            dict: Information about the backup operation.
+        """
+        filters = filters or {}
+        if user_id:
+            filters["user_id"] = user_id
+        if agent_id:
+            filters["agent_id"] = agent_id
+        if run_id:
+            filters["run_id"] = run_id
+        
+        memories_data = self.get_all(user_id=user_id, agent_id=agent_id, run_id=run_id)
+        
+        # Structure the data to include metadata and vector embeddings
+        backup_data = {
+            "timestamp": datetime.now(pytz.timezone("US/Pacific")).isoformat(),
+            "version": self.api_version,
+            "filters": filters,
+            "memories": []
+        }
+        
+        # Handle API version differences in get_all return format
+        if self.api_version == "v1.0":
+            memories_list = memories_data
+        else:
+            memories_list = memories_data.get("results", [])
+        
+        # For each memory, get full data including embeddings
+        for memory in memories_list:
+            memory_id = memory.get("id")
+            memory_obj = self.vector_store.get(vector_id=memory_id)
+            
+            if memory_obj:
+                memory_vector = self.vector_store.get_vector(vector_id=memory_id)
+                
+                memory_entry = {
+                    "id": memory_id,
+                    "data": memory_obj.payload,
+                    "vector": memory_vector.tolist() if memory_vector is not None else None,
+                    "history": self.db.get_history(memory_id)
+                }
+                backup_data["memories"].append(memory_entry)
+        
+        os.makedirs(os.path.dirname(os.path.abspath(file_path)), exist_ok=True)
+        with open(file_path, 'w', encoding='utf-8') as f:
+            json.dump(backup_data, f, ensure_ascii=False, indent=2)
+        
+        capture_event("mem0.backup", self, {"file_path": file_path, "memory_count": len(backup_data["memories"])})
+        
+        return {
+            "message": f"Successfully backed up {len(backup_data['memories'])} memories to {file_path}",
+            "backup_path": file_path,
+            "memory_count": len(backup_data["memories"])
+        }
+
+    def restore_from_file(self, file_path, restore_embeddings=True):
+        """
+        Restore memories from a backup file.
+        
+        Args:
+            file_path (str): Path to the backup file.
+            restore_embeddings (bool): Whether to restore the vector embeddings.
+            
+        Returns:
+            dict: Information about the restore operation.
+        """
+        if not os.path.exists(file_path):
+            raise FileNotFoundError(f"Backup file not found: {file_path}")
+        
+        # Load backup data
+        with open(file_path, 'r', encoding='utf-8') as f:
+            backup_data = json.load(f)
+        
+        restored_count = 0
+        skipped_count = 0
+        errors = []
+        
+        for memory in backup_data["memories"]:
+            try:
+                memory_id = memory["id"]
+                payload = memory["data"]
+                vector = memory.get("vector")
+                
+                existing_memory = None
+                try:
+                    existing_memory = self.vector_store.get(vector_id=memory_id)
+                except Exception:
+                    pass
+                
+                if existing_memory:
+                    skipped_count += 1
+                    continue
+                    
+                # Insert the memory with its embeddings
+                if restore_embeddings and vector:
+                    vector_array = np.array(vector, dtype=np.float32)
+                    self.vector_store.insert(
+                        vectors=[vector_array],
+                        ids=[memory_id],
+                        payloads=[payload]
+                    )
+                else:
+                    # If not restoring embeddings, generate new ones
+                    data = payload.get("data", "")
+                    embeddings = self.embedding_model.embed(data, "add")
+                    self.vector_store.insert(
+                        vectors=[embeddings],
+                        ids=[memory_id],
+                        payloads=[payload]
+                    )
+                
+                # Restore history if available
+                history = memory.get("history", [])
+                for entry in history:
+                    self.db.add_history(
+                        memory_id=memory_id,
+                        prev_value=entry.get("prev_value"),
+                        new_value=entry.get("new_value"),
+                        action=entry.get("action"),
+                        created_at=entry.get("created_at"),
+                        updated_at=entry.get("updated_at"),
+                        is_deleted=entry.get("is_deleted", 0)
+                    )
+                    
+                restored_count += 1
+                
+            except Exception as e:
+                errors.append({"id": memory.get("id"), "error": str(e)})
+        
+        capture_event("mem0.restore", self, {
+            "file_path": file_path, 
+            "restored_count": restored_count,
+            "skipped_count": skipped_count,
+            "error_count": len(errors)
+        })
+        
+        return {
+            "message": f"Restored {restored_count} memories, skipped {skipped_count} existing memories, with {len(errors)} errors",
+            "restored_count": restored_count,
+            "skipped_count": skipped_count,
+            "errors": errors[:10] if errors else []
+        }
 
 
 class AsyncMemory(MemoryBase):
@@ -1563,3 +1718,163 @@ class AsyncMemory(MemoryBase):
 
     async def chat(self, query):
         raise NotImplementedError("Chat function not implemented yet.")
+
+    async def backup_to_file(self, file_path, user_id=None, agent_id=None, run_id=None, filters=None):
+        """
+        Backup memories to a file.
+        
+        Args:
+            file_path (str): Path to save the backup file.
+            user_id (str, optional): Filter memories by user ID.
+            agent_id (str, optional): Filter memories by agent ID.
+            run_id (str, optional): Filter memories by run ID.
+            filters (dict, optional): Additional filters to apply.
+            
+        Returns:
+            dict: Information about the backup operation.
+        """
+        # Prepare filters
+        filters = filters or {}
+        if user_id:
+            filters["user_id"] = user_id
+        if agent_id:
+            filters["agent_id"] = agent_id
+        if run_id:
+            filters["run_id"] = run_id
+        
+        memories_data = await self.get_all(user_id=user_id, agent_id=agent_id, run_id=run_id)
+        
+        backup_data = {
+            "timestamp": datetime.now(pytz.timezone("US/Pacific")).isoformat(),
+            "version": self.api_version,
+            "filters": filters,
+            "memories": []
+        }
+        
+        # Handle API version differences in get_all return format
+        if self.api_version == "v1.0":
+            memories_list = memories_data
+        else:
+            memories_list = memories_data.get("results", [])
+        
+        for memory in memories_list:
+            memory_id = memory.get("id")
+            memory_obj = await asyncio.to_thread(self.vector_store.get, vector_id=memory_id)
+            
+            if memory_obj:
+                memory_vector = await asyncio.to_thread(self.vector_store.get_vector, vector_id=memory_id)
+                
+                # Add to backup data
+                memory_entry = {
+                    "id": memory_id,
+                    "data": memory_obj.payload,
+                    "vector": memory_vector.tolist() if memory_vector is not None else None,
+                    "history": await asyncio.to_thread(self.db.get_history, memory_id)
+                }
+                backup_data["memories"].append(memory_entry)
+        
+        os.makedirs(os.path.dirname(os.path.abspath(file_path)), exist_ok=True)
+        with open(file_path, 'w', encoding='utf-8') as f:
+            json.dump(backup_data, f, ensure_ascii=False, indent=2)
+        
+        capture_event("mem0.backup", self, {"file_path": file_path, "memory_count": len(backup_data["memories"])})
+        
+        return {
+            "message": f"Successfully backed up {len(backup_data['memories'])} memories to {file_path}",
+            "backup_path": file_path,
+            "memory_count": len(backup_data["memories"])
+        }
+
+    async def restore_from_file(self, file_path, restore_embeddings=True):
+        """
+        Restore memories from a backup file.
+        
+        Args:
+            file_path (str): Path to the backup file.
+            restore_embeddings (bool): Whether to restore the vector embeddings.
+            
+        Returns:
+            dict: Information about the restore operation.
+        """
+        if not os.path.exists(file_path):
+            raise FileNotFoundError(f"Backup file not found: {file_path}")
+        
+        # Load backup data
+        with open(file_path, 'r', encoding='utf-8') as f:
+            backup_data = json.load(f)
+        
+        # Track restoration stats
+        restored_count = 0
+        skipped_count = 0
+        errors = []
+        
+        # Restore each memory
+        for memory in backup_data["memories"]:
+            try:
+                memory_id = memory["id"]
+                payload = memory["data"]
+                vector = memory.get("vector")
+                
+                # Check if memory already exists
+                existing_memory = None
+                try:
+                    existing_memory = await asyncio.to_thread(self.vector_store.get, vector_id=memory_id)
+                except Exception:
+                    pass
+                
+                if existing_memory:
+                    skipped_count += 1
+                    continue
+                    
+                # Insert the memory with its embeddings
+                if restore_embeddings and vector:
+                    vector_array = np.array(vector, dtype=np.float32)
+                    await asyncio.to_thread(
+                        self.vector_store.insert,
+                        vectors=[vector_array],
+                        ids=[memory_id],
+                        payloads=[payload]
+                    )
+                else:
+                    # If not restoring embeddings, generate new ones
+                    data = payload.get("data", "")
+                    embeddings = await asyncio.to_thread(self.embedding_model.embed, data, "add")
+                    await asyncio.to_thread(
+                        self.vector_store.insert,
+                        vectors=[embeddings],
+                        ids=[memory_id],
+                        payloads=[payload]
+                    )
+                
+                # Restore history if available
+                history = memory.get("history", [])
+                for entry in history:
+                    await asyncio.to_thread(
+                        self.db.add_history,
+                        memory_id=memory_id,
+                        prev_value=entry.get("prev_value"),
+                        new_value=entry.get("new_value"),
+                        action=entry.get("action"),
+                        created_at=entry.get("created_at"),
+                        updated_at=entry.get("updated_at"),
+                        is_deleted=entry.get("is_deleted", 0)
+                    )
+                    
+                restored_count += 1
+                
+            except Exception as e:
+                errors.append({"id": memory.get("id"), "error": str(e)})
+        
+        capture_event("mem0.restore", self, {
+            "file_path": file_path, 
+            "restored_count": restored_count,
+            "skipped_count": skipped_count,
+            "error_count": len(errors)
+        })
+        
+        return {
+            "message": f"Restored {restored_count} memories, skipped {skipped_count} existing memories, with {len(errors)} errors",
+            "restored_count": restored_count,
+            "skipped_count": skipped_count,
+            "errors": errors[:10] if errors else []
+        }

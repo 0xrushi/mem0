@@ -184,6 +184,20 @@ class ChromaDB(VectorStoreBase):
         result = self.collection.get(ids=[vector_id])
         return self._parse_output(result)[0]
 
+    def get_vector(self, vector_id: str):
+        """
+        Retrieve the embedding vector for a given memory ID.
+        Args:
+            vector_id (str): The ID of the vector to retrieve.
+        Returns:
+            list or None: The embedding vector, or None if not found.
+        """
+        result = self.collection.get(ids=[vector_id])
+        embeddings = result.get("embeddings", [])
+        if embeddings and len(embeddings) > 0:
+            return embeddings[0]
+        return None
+
     def list_cols(self) -> List[chromadb.Collection]:
         """
         List all collections.
